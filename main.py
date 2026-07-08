@@ -494,6 +494,7 @@ def main():
                 continue
 
             # 合并
+            merged_ch_count = len(article["chapter_urls"])  # 保存章节数
             merged = "\n".join(
                 f"第{j + 1}章 {t}\n{'-' * 40}\n{c}\n"
                 for j, (t, c) in enumerate(chapters_content)
@@ -503,7 +504,6 @@ def main():
                 "date": article["date"], "category": article["category"],
                 "word_count": total_wc, "content": merged,
             }
-            merged_ch_count = len(article["chapter_urls"])  # 在 article 被覆盖前保存
             kind = "merged"
         else:
             merged_ch_count = 0

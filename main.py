@@ -12,11 +12,14 @@
   python main.py                              # 开始爬取（支持断点续传）
   python main.py --start-page=5 --end-page=10 # 指定页码范围
   python main.py --reset                      # 清除进度，从头开始
+  python main.py --workers=8                  # 8 线程并行下载
 """
 
 import requests
 from bs4 import BeautifulSoup
-import time, os, re, json, sys, argparse
+import time, os, re, json, sys, argparse, random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 # Windows 控制台 UTF-8 支持
 if sys.platform == "win32":
@@ -36,14 +39,65 @@ OUTPUT_DIR = "novels"
 PROGRESS_FILE = "progress.json"
 MIN_WORDS = 500
 EXCLUDED_CATEGORY = "互动小说"
-DELAY = 1.5
+DELAY = 0.5              # 基础请求间隔
 TIMEOUT = 30
 MAX_RETRIES = 3
+DEFAULT_WORKERS = 6
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-}
+# 反屏蔽：随机 UA 池
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+]
+
+# 全局速率控制
+class RateLimiter:
+    """令牌桶风格的全局速率限制器，保证总 QPS 不超过上限"""
+
+    def __init__(self, max_rps: float = 6):
+        self.max_rps = max_rps
+        self.min_interval = 1.0 / max_rps
+        self.last_time = 0.0
+        self.lock = Lock()
+        self._403_backoff = 0.0   # 遇到 403 后全局暂停秒数
+        self._403_count = 0
+
+    def acquire(self):
+        """阻塞直到可以发送下一个请求"""
+        with self.lock:
+            now = time.time()
+            wait = self.min_interval - (now - self.last_time)
+            if self._403_backoff > 0:
+                wait = max(wait, self._403_backoff)
+                self._403_backoff = 0
+            if wait > 0:
+                time.sleep(wait)
+            self.last_time = time.time()
+
+    def report_403(self):
+        """收到 403 后触发指数退避"""
+        with self.lock:
+            self._403_count += 1
+            self._403_backoff = min(5 * (2 ** (self._403_count - 1)), 120)
+            self.min_interval = min(self.min_interval * 1.5, 3.0)
+
+    def report_success(self):
+        """成功请求后逐渐降低退避"""
+        with self.lock:
+            self._403_count = max(0, self._403_count - 0.1)
+
+rate_limiter = RateLimiter(max_rps=4)  # 全局最大每秒请求数，建议 3-5
+
+
+def _random_headers() -> dict:
+    return {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": BASE_URL + "/",
+    }
 
 # ============================================================
 # 工具函数
@@ -51,23 +105,27 @@ HEADERS = {
 
 
 def safe_filename(name: str) -> str:
-    """清理文件名中的非法字符"""
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', " ", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name[:200] if len(name) > 200 else name
 
 
 def http_get(url: str) -> requests.Response | None:
-    """带重试的 HTTP GET 请求"""
     for i in range(MAX_RETRIES):
+        rate_limiter.acquire()
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            resp = requests.get(url, headers=_random_headers(), timeout=TIMEOUT)
+            if resp.status_code == 403:
+                rate_limiter.report_403()
+                print(f"\n  ⚠ 403 被限速，自动降速（全局 QPS 已下调）")
+                time.sleep(10 * (i + 1))
+                continue
             resp.raise_for_status()
+            rate_limiter.report_success()
             return resp
-        except requests.RequestException as e:
-            print(f"  ⚠ 请求失败 ({i + 1}/{MAX_RETRIES}): {e}")
+        except requests.RequestException:
             if i < MAX_RETRIES - 1:
-                time.sleep(DELAY * (i + 1))
+                time.sleep(DELAY * (i + 1) * random.uniform(0.8, 1.5))
     return None
 
 
@@ -88,8 +146,34 @@ def save_progress(progress: dict):
 # ============================================================
 
 
-def collect_urls(resume: dict | None = None, start: int = 1, end: int = 0) -> list[str]:
-    """遍历列表页收集全部文章 URL"""
+def _parse_list_page(html: str) -> list[str]:
+    """从列表页 HTML 提取文章 URL 列表"""
+    soup = BeautifulSoup(html, "lxml")
+    urls = []
+    for article in soup.find_all("article"):
+        link = article.find("a", class_="post-title")
+        if link and link.get("href"):
+            urls.append(link["href"])
+    return urls
+
+
+def _discover_last_page(start: int) -> int:
+    """获取第一页，从分页链接中推断最后一页的页码"""
+    resp = http_get(LIST_PAGE.format(start))
+    if not resp:
+        return start
+    soup = BeautifulSoup(resp.text, "lxml")
+    max_page = start
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/page/(\d+)/", a["href"])
+        if m:
+            max_page = max(max_page, int(m.group(1)))
+    return max_page
+
+
+def collect_urls(resume: dict | None = None, start: int = 1, end: int = 0,
+                 workers: int = 10) -> list[str]:
+    """收集全部文章 URL（首尾页串行探测，中间页并行抓取）"""
     urls = []
     done = set()
 
@@ -99,52 +183,40 @@ def collect_urls(resume: dict | None = None, start: int = 1, end: int = 0) -> li
             start = max(resume.get("current_page", 1), 1)
         urls = resume.get("collected_urls", [])
 
-    page, empty_streak = start, 0
+    # 确定最后一页
+    last_page = end if end > 0 else _discover_last_page(start)
+    pages = list(range(start, last_page + 1))
 
-    while True:
-        if end > 0 and page > end:
-            print(f"--end-page={end} 已达到，停止扫描")
-            break
+    if not pages:
+        print("📊 无页面需要扫描")
+        return urls
 
-        print(f"📄 扫描: {LIST_PAGE.format(page)}", end=" ")
-        resp = http_get(LIST_PAGE.format(page))
+    print(f"📄 扫描第 {start}~{last_page} 页（共 {len(pages)} 页，{workers} 线程）...")
 
-        if resp is None:
-            empty_streak += 1
-            print("❌")
-            if empty_streak >= 3:
-                break
-            page += 1
-            time.sleep(DELAY)
-            continue
+    # 并行抓取所有列表页
+    lock = Lock()
+    count = 0
 
-        soup = BeautifulSoup(resp.text, "lxml")
-        new = 0
-        for article in soup.find_all("article"):
-            link = article.find("a", class_="post-title")
-            if link and link.get("href"):
-                href = link["href"]
-                if href not in done and href not in urls:
-                    urls.append(href)
-                    new += 1
+    def _fetch_one(p):
+        nonlocal count
+        resp = http_get(LIST_PAGE.format(p))
+        page_urls = _parse_list_page(resp.text) if resp else []
+        with lock:
+            count += 1
+            if count % 50 == 0 or count == len(pages):
+                print(f"  ... {count}/{len(pages)} 页")
+        return page_urls
 
-        print(f"→ {new} 篇，累计 {len(urls)} 篇")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = executor.map(_fetch_one, pages)
 
-        if new == 0:
-            empty_streak += 1
-            if empty_streak >= 3:
-                print("✅ 已到达最后一页")
-                break
-        else:
-            empty_streak = 0
+    for page_urls in results:
+        for href in page_urls:
+            if href not in done and href not in urls:
+                urls.append(href)
 
-        if page % 10 == 0:
-            save_progress({**load_progress(), "collected_urls": urls, "current_page": page + 1})
-
-        page += 1
-        time.sleep(DELAY)
-
-    print(f"\n📊 共收集 {len(urls)} 篇文章链接")
+    save_progress({**load_progress(), "collected_urls": urls, "current_page": last_page + 1})
+    print(f"📊 共收集 {len(urls)} 篇文章链接")
     return urls
 
 
@@ -153,25 +225,13 @@ def collect_urls(resume: dict | None = None, start: int = 1, end: int = 0) -> li
 # ============================================================
 
 
-def _find_text(soup, selector, default=""):
-    """在 soup 中查找元素并提取文本"""
-    el = soup.find(**selector) if isinstance(selector, dict) else soup.find(selector)
-    if not el:
-        return default
-    # 如果元素内有 <a>，提取 <a> 的文本，否则用自身文本
-    a = el.find("a")
-    return a.get_text(strip=True) if a else el.get_text(strip=True)
-
-
 def _extract_meta(soup) -> dict:
-    """从文章页提取元数据"""
-    title = _find_text(soup, {"class_": "post-title"}, "未命名")
+    title_el = soup.find("a", class_="post-title")
+    title = title_el.get_text(strip=True) if title_el else "未命名"
 
-    # 分类
     cat_div = soup.find(class_="post-meta-detail-categories")
     categories = [a.get_text(strip=True) for a in cat_div.find_all("a")] if cat_div else []
 
-    # 字数
     wc = 0
     for div in soup.find_all(class_="post-meta-detail-words"):
         m = re.search(r"(\d+)\s*字", div.get_text(strip=True))
@@ -179,51 +239,37 @@ def _extract_meta(soup) -> dict:
             wc = int(m.group(1))
             break
 
-    # 作者
     author_div = soup.find(class_="post-meta-detail-author")
     author = author_div.find("a").get_text(strip=True) if author_div and author_div.find("a") else ""
 
-    # 日期
     time_div = soup.find(class_="post-meta-detail-time")
     date = time_div.find("time").get_text(strip=True) if time_div and time_div.find("time") else ""
 
-    return {
-        "title": title,
-        "author": author,
-        "date": date,
-        "category": ",".join(categories),
-        "categories": categories,
-        "word_count": wc,
-    }
+    return {"title": title, "author": author, "date": date,
+            "category": ",".join(categories), "categories": categories, "word_count": wc}
 
 
-# 非正文区域的 CSS 选择器
 _SKIP_SELECTORS = [
     "#toc", ".post-series", ".post-series-nav",
     ".saboxplugin-wrap", "#related_posts", ".wpulike",
-    ".wp_ulike_general_class", ".post-tags",
-    ".additional-content-after-post",
+    ".wp_ulike_general_class", ".post-tags", ".additional-content-after-post",
 ]
 
 
 def _extract_content(soup: BeautifulSoup) -> str:
-    """从文章页提取正文文本"""
     container = soup.find("div", class_="post-content")
     if not container:
         return ""
 
-    # 移除所有非正文区域
     for sel in _SKIP_SELECTORS:
         for el in container.select(sel):
             el.decompose()
 
-    # 移除空 div / 元数据 div
     for div in container.find_all("div"):
         text = div.get_text(strip=True)
         if not text or text == "[pilipili]" or ("反馈/举报" in text and len(text) < 30):
             div.decompose()
 
-    # 收集正文段落（支持 p、div.ace-line、裸 div 三种格式）
     parts = []
     for tag in container.find_all(["p", "div"]):
         if tag.name == "div":
@@ -231,9 +277,9 @@ def _extract_content(soup: BeautifulSoup) -> str:
             if classes:
                 if "ace-line" not in classes:
                     continue
-                if tag.find("div", class_="ace-line"):  # 跳过包装 div
+                if tag.find("div", class_="ace-line"):
                     continue
-            elif tag.find("div"):  # 裸 div 只取叶子节点
+            elif tag.find("div"):
                 continue
 
         for br in tag.find_all("br"):
@@ -247,29 +293,23 @@ def _extract_content(soup: BeautifulSoup) -> str:
 
 
 def _extract_chapters(soup: BeautifulSoup, current_url: str) -> tuple | None:
-    """提取章节列表，返回 (series_name, series_id, [(url, title), ...]) 或 None"""
     container = soup.find("div", class_="post-content")
     if not container:
         return None
-
     series = container.find(class_="post-series")
     if not series:
         return None
 
-    # 系列名称和 slug
-    name = "未命名系列"
-    slug = ""
+    name, slug = "未命名系列", ""
     title_el = series.find(class_="post-series-title")
     if title_el:
         link = title_el.find("a", href=lambda h: h and "/series/" in h)
         if link:
-            name = link.get_text(strip=True)
-            slug = link["href"]
+            name, slug = link.get_text(strip=True), link["href"]
     if slug:
         m = re.search(r"/series/([^/]+)/", slug)
         slug = m.group(1) if m else ""
 
-    # 提取章节
     chapters = []
     for item in series.find_all("li", class_="post-series-item"):
         item_title = item.find(class_="post-series-item-title")
@@ -280,66 +320,56 @@ def _extract_chapters(soup: BeautifulSoup, current_url: str) -> tuple | None:
         if link and "/archives/" in link["href"]:
             chapters.append((link["href"], ch_title))
         else:
-            page_title = soup.find("a", class_="post-title")
-            chapters.append((current_url, page_title.get_text(strip=True) if page_title else ch_title))
+            pt = soup.find("a", class_="post-title")
+            chapters.append((current_url, pt.get_text(strip=True) if pt else ch_title))
 
     return (name, slug, chapters)
 
 
-def download_article(url: str, skip_filter: bool = False) -> dict | None:
+def _download_page(url: str, skip_filter: bool = False) -> tuple:
     """
-    下载并解析一篇文章。
-    返回 dict（含 title/content/word_count/等）或 None（需过滤/下载失败）。
-    如果文章有章节列表，附加 series_name/series_id/chapter_urls 字段。
+    下载一篇文章页。
+    返回 (article_dict, status, reason)。
+    status: "ok" / "filtered" / "network_error"
+    reason: 过滤原因描述（仅 filtered 时有意义）
     """
     resp = http_get(url)
     if not resp:
-        return None
+        return None, "network_error", ""
 
     soup = BeautifulSoup(resp.text, "lxml")
     meta = _extract_meta(soup)
 
-    # 过滤
     if not skip_filter:
         if EXCLUDED_CATEGORY in meta["categories"]:
-            print(f"  ⏭ 跳过（互动小说）: {meta['title']}")
-            return None
+            return None, "filtered", f"「{meta['title']}」互动小说"
         if meta["word_count"] > 0 and meta["word_count"] < MIN_WORDS:
-            print(f"  ⏭ 跳过（{meta['word_count']} 字 < {MIN_WORDS}）: {meta['title']}")
-            return None
+            return None, "filtered", f"「{meta['title']}」{meta['word_count']} 字 < {MIN_WORDS}"
 
-    # 章节检测（必须在提取正文前，正文提取会移除 .post-series）
     chapters = _extract_chapters(soup, url)
-
-    # 正文
     content = _extract_content(soup)
     actual_len = len(content.replace("\n", "").replace(" ", ""))
 
     if not skip_filter and meta["word_count"] == 0 and actual_len < MIN_WORDS:
-        print(f"  ⏭ 跳过（实际字数 {actual_len} < {MIN_WORDS}）: {meta['title']}")
-        return None
+        return None, "filtered", f"「{meta['title']}」实际 {actual_len} 字 < {MIN_WORDS}"
 
     result = {
-        "url": url,
-        "title": meta["title"],
-        "author": meta["author"],
-        "date": meta["date"],
-        "category": meta["category"],
-        "word_count": meta["word_count"] or actual_len,
-        "content": content,
+        "url": url, "title": meta["title"], "author": meta["author"],
+        "date": meta["date"], "category": meta["category"],
+        "word_count": meta["word_count"] or actual_len, "content": content,
     }
     if chapters:
         result["series_name"], result["series_id"], result["chapter_urls"] = chapters
-    return result
+    return result, "ok", ""
 
 
 def _download_chapter(url: str) -> dict | None:
-    """下载单个章节（不过滤，带额外重试）"""
+    """下载单个章节（不过滤，额外重试）。返回 None 表示网络失败。"""
     for i in range(MAX_RETRIES + 1):
-        article = download_article(url, skip_filter=True)
-        if article and article.get("content"):
-            return article
-        if i < MAX_RETRIES:
+        ch, status, _ = _download_page(url, skip_filter=True)
+        if ch and ch.get("content"):
+            return ch
+        if status == "network_error" and i < MAX_RETRIES:
             time.sleep(DELAY * (i + 1))
     return None
 
@@ -350,10 +380,8 @@ def _download_chapter(url: str) -> dict | None:
 
 
 def save_txt(article: dict) -> str:
-    """保存文章为 txt，返回文件路径"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     filepath = os.path.join(OUTPUT_DIR, safe_filename(article["title"]) + ".txt")
-
     header = (
         f"标题：{article['title']}\n"
         f"作者：{article['author']}\n"
@@ -365,8 +393,98 @@ def save_txt(article: dict) -> str:
     )
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(header + article["content"])
-
     return filepath
+
+
+# ============================================================
+# 并行下载工作函数
+# ============================================================
+
+
+def _worker(url: str, completed: set, merged_series: set,
+            processing_series: set, lock: Lock, idx: int) -> dict:
+    """
+    单个 URL 的下载工作函数（线程安全）。
+    返回结果 dict: {kind, article?, path?, ch_count?, reason?, idx, url}
+    """
+    # ── 原子认领 URL ──
+    with lock:
+        if url in completed:
+            return {"kind": "skip", "reason": f"已被其他线程认领: {url}",
+                    "idx": idx, "url": url}
+        completed.add(url)
+
+    # ── 下载页面 ──
+    article, status, reason = _download_page(url)
+    if article is None:
+        if status == "network_error":
+            # 网络错误——放回队列，下次重试
+            with lock:
+                completed.discard(url)
+            return {"kind": "fail", "reason": f"网络错误，已放回重试: {url}",
+                    "idx": idx, "url": url}
+        # 过滤——永久跳过
+        return {"kind": "skip", "reason": reason, "idx": idx, "url": url}
+
+    # ── 普通文章 ──
+    if not article.get("chapter_urls"):
+        path = save_txt(article)
+        return {"kind": "success", "article": article, "path": path, "idx": idx, "url": url}
+
+    # ── 系列文章 ──
+    sid = article["series_id"]
+    sname = article.get("series_name", article["title"])
+    ch_urls = article["chapter_urls"]
+
+    with lock:
+        if sid and sid in merged_series:
+            return {"kind": "skip", "reason": f"系列「{sname}」已合并", "idx": idx, "url": url}
+        if sid and sid in processing_series:
+            return {"kind": "skip", "reason": f"系列「{sname}」处理中", "idx": idx, "url": url}
+        # 认领系列（只锁 slug，不预认领章节 URL——避免崩溃后丢失未下载的章节）
+        if sid:
+            processing_series.add(sid)
+
+    # ── 下载系列全部章节 ──
+    chapters_content = []
+    total_wc = 0
+    for _ci, (ch_url, ch_title) in enumerate(ch_urls):
+        if ch_url == url:
+            chapters_content.append((ch_title, article["content"]))
+            total_wc += article["word_count"]
+        else:
+            ch = _download_chapter(ch_url)
+            if ch:
+                chapters_content.append((ch_title, ch["content"]))
+                total_wc += ch["word_count"]
+            else:
+                chapters_content.append((ch_title, "[下载失败]"))
+        # 每下载一章就标记完成（崩溃后可断点续传）
+        with lock:
+            completed.add(ch_url)
+
+    with lock:
+        if sid:
+            processing_series.discard(sid)
+            merged_series.add(sid)
+
+    if total_wc < MIN_WORDS:
+        return {"kind": "skip", "reason": f"系列总字数 {total_wc} < {MIN_WORDS}", "idx": idx, "url": url}
+
+    # ── 合并保存 ──
+    merged_ch_count = len(ch_urls)
+    merged = "\n".join(
+        f"第{j + 1}章 {t}\n{'-' * 40}\n{c}\n"
+        for j, (t, c) in enumerate(chapters_content)
+    )
+    merged_article = {
+        "url": url, "title": sname, "author": article["author"],
+        "date": article["date"], "category": article["category"],
+        "word_count": total_wc, "content": merged,
+    }
+    path = save_txt(merged_article)
+    return {"kind": "merged", "article": merged_article, "path": path,
+            "ch_count": merged_ch_count, "idx": idx, "url": url}
 
 
 # ============================================================
@@ -382,6 +500,8 @@ def main():
     parser.add_argument("--end-page", type=int, default=0, help="结束列表页（0=到最后）")
     parser.add_argument("--max-pages", type=int, default=0, help="最多扫描页数")
     parser.add_argument("--max-articles", type=int, default=0, help="最多下载篇数（测试用）")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"并行下载线程数（默认 {DEFAULT_WORKERS}）")
     args = parser.parse_args()
 
     start_page = args.start_page
@@ -401,10 +521,10 @@ def main():
     print("📚 艾利浩斯图书馆 小说爬虫")
     print(f"   输出: {OUTPUT_DIR}/  |  第 {start_page}~{'最后' if end_page == 0 else end_page} 页")
     print(f"   过滤: 字数<{MIN_WORDS} 或 互动小说  |  章节: 自动合并")
-    print(f"   进度: 已下载 {len(completed)} 篇")
+    print(f"   线程: {args.workers}  |  进度: 已下载 {len(completed)} 篇")
     print("=" * 60)
 
-    # --- 收集链接 ---
+    # ── 收集链接 ──
     print("\n🔍 第一步：收集文章链接...")
     ranged = args.start_page != 1 or args.end_page != 0 or args.max_pages > 0
 
@@ -412,7 +532,8 @@ def main():
     if not all_urls or ranged:
         if all_urls and ranged:
             print("📌 页码范围变更，重新收集...")
-        all_urls = collect_urls(None if ranged else progress, start_page, end_page)
+        all_urls = collect_urls(None if ranged else progress, start_page, end_page,
+                                 workers=args.workers)
         progress.update(collected_urls=all_urls, current_page=start_page)
         save_progress(progress)
     else:
@@ -421,119 +542,74 @@ def main():
     if args.collect_only:
         return print(f"\n✅ 共 {len(all_urls)} 个链接")
 
-    # 待下载列表
     pending = [u for u in all_urls if u not in completed]
     if args.max_articles > 0 and len(pending) > args.max_articles:
         pending = pending[:args.max_articles]
         print(f"\n📌 限制: --max-articles={args.max_articles}")
-    print(f"\n📌 待下载: {len(pending)} 篇（已完成: {len(completed)} 篇）")
+    print(f"\n📌 待下载: {len(pending)} 篇  |  线程: {args.workers}")
 
     if not pending:
         return print("✅ 全部完成！")
 
-    # --- 逐篇下载 ---
-    print("\n📥 第二步：下载文章...\n" + "-" * 40)
+    # ── 并行下载 ──
+    print(f"\n📥 第二步：并行下载（{args.workers} 线程）...\n" + "-" * 40)
+
     stats = {"success": 0, "merged": 0, "skip": 0, "fail": 0}
+    lock = Lock()
+    processing_series = set()
+    total = len(pending)
+    print_lock = Lock()  # 防止打印交错
 
-    for i, url in enumerate(pending):
-        if url in completed:
-            continue
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {}
+        for i, url in enumerate(pending):
+            f = executor.submit(_worker, url, completed, merged_series,
+                                processing_series, lock, i + 1)
+            futures[f] = i + 1
 
-        print(f"\n[{i + 1}/{len(pending)}] {url}")
-
-        try:
-            article = download_article(url)
-        except Exception as e:
-            print(f"  ❌ 异常: {e}")
-            stats["fail"] += 1
-            completed.add(url)
-            continue
-
-        if article is None:
-            stats["skip"] += 1
-            completed.add(url)
-            continue
-
-        # --- 章节合并 ---
-        if article.get("chapter_urls"):
-            sid = article["series_id"]
-            sname = article.get("series_name", article["title"])
-
-            if sid and sid in merged_series:
-                print(f"  ⏭ 系列「{sname}」已合并过")
-                stats["skip"] += 1
-                completed.add(url)
+        for f in as_completed(futures):
+            idx = futures[f]
+            try:
+                r = f.result()
+            except Exception as e:
+                with print_lock:
+                    print(f"[{idx}/{total}] ❌ 线程异常: {e}")
+                stats["fail"] += 1
                 continue
 
-            print(f"  📖 系列「{sname}」共 {len(article['chapter_urls'])} 章，合并中...")
-            chapters_content = []
-            total_wc = 0
+            kind = r["kind"]
+            with print_lock:
+                if kind == "success":
+                    a = r["article"]
+                    print(f"[{idx}/{total}] ✅ {a['title']}")
+                    print(f"     {a['author']} | {a['word_count']} 字 | {r['path']}")
+                    stats["success"] += 1
+                elif kind == "merged":
+                    a = r["article"]
+                    print(f"[{idx}/{total}] 📖 合并 {r['ch_count']} 章: {a['title']}")
+                    print(f"     {a['author']} | {a['word_count']} 字 | {r['path']}")
+                    stats["merged"] += 1
+                elif kind == "skip":
+                    print(f"[{idx}/{total}] ⏭ {r.get('reason', '')}")
+                    stats["skip"] += 1
+                elif kind == "fail":
+                    print(f"[{idx}/{total}] ❌ {r.get('reason', '')}")
+                    stats["fail"] += 1
 
-            for ci, (ch_url, ch_title) in enumerate(article["chapter_urls"]):
-                if ch_url == url:
-                    chapters_content.append((ch_title, article["content"]))
-                    total_wc += article["word_count"]
-                    print(f"    [{ci + 1}/{len(article['chapter_urls'])}] {ch_title} (当前)")
-                else:
-                    print(f"    [{ci + 1}/{len(article['chapter_urls'])}] {ch_title} ...", end=" ", flush=True)
-                    ch = _download_chapter(ch_url)
-                    if ch:
-                        chapters_content.append((ch_title, ch["content"]))
-                        total_wc += ch["word_count"]
-                        print("OK")
-                    else:
-                        chapters_content.append((ch_title, "[下载失败]"))
-                        print("FAIL")
-                    time.sleep(DELAY * 2)
-                completed.add(ch_url)
+            # 定期存盘
+            if idx % 25 == 0:
+                with lock:
+                    progress.update(
+                        completed_urls=list(completed),
+                        collected_urls=all_urls,
+                        processed_series=list(merged_series),
+                    )
+                    save_progress(progress)
+                with print_lock:
+                    print(f"  💾 进度已保存（成功 {stats['success']} | 合并 {stats['merged']} | "
+                          f"跳过 {stats['skip']} | 失败 {stats['fail']}）")
 
-            if total_wc < MIN_WORDS:
-                print(f"  ⏭ 系列总字数 {total_wc} < {MIN_WORDS}")
-                stats["skip"] += 1
-                merged_series.add(sid) if sid else None
-                continue
-
-            # 合并
-            merged_ch_count = len(article["chapter_urls"])  # 保存章节数
-            merged = "\n".join(
-                f"第{j + 1}章 {t}\n{'-' * 40}\n{c}\n"
-                for j, (t, c) in enumerate(chapters_content)
-            )
-            article = {
-                "url": url, "title": sname, "author": article["author"],
-                "date": article["date"], "category": article["category"],
-                "word_count": total_wc, "content": merged,
-            }
-            kind = "merged"
-        else:
-            merged_ch_count = 0
-            kind = "success"
-
-        try:
-            path = save_txt(article)
-            tag = f"合并 {merged_ch_count} 章 " if kind == "merged" else ""
-            print(f"  ✅ {tag}已保存: {path}")
-            print(f"     《{article['title']}》| {article['author']} | {article['word_count']} 字")
-            stats[kind] += 1
-        except Exception as e:
-            print(f"  ❌ 保存失败: {e}")
-            stats["fail"] += 1
-
-        completed.add(url)
-
-        # 定期存盘
-        if (i + 1) % 5 == 0:
-            progress.update(
-                completed_urls=list(completed),
-                collected_urls=all_urls,
-                processed_series=list(merged_series),
-            )
-            save_progress(progress)
-            print(f"  💾 进度已保存（成功 {stats['success']} | 合并 {stats['merged']} | 跳过 {stats['skip']} | 失败 {stats['fail']}）")
-
-        time.sleep(DELAY)
-
-    # 最终存盘
+    # ── 最终存盘 ──
     progress.update(
         completed_urls=list(completed),
         collected_urls=all_urls,
